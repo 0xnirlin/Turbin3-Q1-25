@@ -1,4 +1,5 @@
 *wallet.json
 node_modules
 target
-.DS_Store
+.DS_Storets/cluster1/wba-wallet.json
+/ts/cluster1/wba-wallet.json
