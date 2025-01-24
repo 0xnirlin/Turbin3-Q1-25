@@ -4,6 +4,9 @@ members = [
 ]
 resolver = "2"
 
+# Add minimum rust version
+rust-version = "1.70.0"
+
 [profile.release]
 overflow-checks = true
 lto = "fat"
