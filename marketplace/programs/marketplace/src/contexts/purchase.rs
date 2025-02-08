@@ -149,6 +149,8 @@ impl<'info> Purchase<'info> {
         Ok(())
     }
 
+    // what if we want to add the fee in a certain token, IMO we can do that too. 
+
     // reward buter
     pub fn reward_buyer(&mut self) -> Result<()> {
         let cpi_program = self.token_program.to_account_info();
