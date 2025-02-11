@@ -28,8 +28,10 @@ pub struct Delist<'info> {
     )]
     pub vault: InterfaceAccount<'info, TokenAccount>,
     #[account(
+        mut,
         seeds = [marketplace.key().as_ref(), maker_mint.key().as_ref()],
         bump,
+        close = maker,
     )]
     pub listing: Account<'info, Listing>,
     pub collection_mint: InterfaceAccount<'info, Mint>,
