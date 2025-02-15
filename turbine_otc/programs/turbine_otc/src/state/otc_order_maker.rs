@@ -8,6 +8,7 @@ pub struct OTCOrderMaker {
     pub sol_amount: u64,
     pub seller: Option<Pubkey>,
     pub bump: u8,
+    pub vault_bump: u8,
 }
 
 impl OTCOrderMaker {
