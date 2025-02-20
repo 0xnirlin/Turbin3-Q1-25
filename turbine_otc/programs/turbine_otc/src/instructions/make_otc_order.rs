@@ -1,23 +1,50 @@
+/*
+████████╗██╗   ██╗██████╗ ██████╗ ██╗███╗   ██╗███████╗     ██████╗ ████████╗ ██████╗
+╚══██╔══╝██║   ██║██╔══██╗██╔══██╗██║████╗  ██║██╔════╝    ██╔═══██╗╚══██╔══╝██╔════╝
+   ██║   ██║   ██║██████╔╝██████╔╝██║██╔██╗ ██║█████╗      ██║   ██║   ██║   ██║     
+   ██║   ██║   ██║██╔══██╗██╔══██╗██║██║╚██╗██║██╔══╝      ██║   ██║   ██║   ██║     
+   ██║   ╚██████╔╝██║  ██║██████╔╝██║██║ ╚████║███████╗    ╚██████╔╝   ██║   ╚██████╗
+   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝     ╚═════╝    ╚═╝    ╚═════╝
+*/
+
 use anchor_lang::prelude::*;
 use anchor_spl::{
     token::{Mint, TokenInterface, Transfer, transfer},
     associated_token::AssociatedToken,
 };
-use crate::state::OTCOrderMaker;
+use raydium_clmm_cpi::{
+    program::RaydiumClmm,
+    states::{OBSERVATION_SEED, ObservationState, PoolState},
+};
+use crate::state::{OTCOrderMaker, TurbineConfig};
 
-// when creating the order we just want to take the sol from the buyer and send it to the vault that is controlled by this program. 
+// ============================================================================
+// This instruction handles the creation of an OTC (Over-The-Counter) order
+// The buyer deposits SOL into a program-controlled vault as collateral
+// The order can be either:
+// 1. Open to any seller (seller = None)
+// 2. Restricted to a specific seller (seller = Some(pubkey))
+// ============================================================================
 
-// no ata is needed since only the sol transfer is needed. 
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Premium must be within allowed range")]
+    InvalidPremium,
+}
 
 #[derive(Accounts)]
-#[instruction(amount: u64, seed: u64)]
+#[instruction(amount: u64, seed: u64, expiry_timestamp: u64)]
 pub struct CreateOTCOrder<'info> {
+    // The buyer who initiates the OTC order and provides SOL collateral
     #[account(mut)]
     pub buyer: Signer<'info>,
 
+    // The mint address of the token the buyer wishes to purchase
     pub token_mint: InterfaceAccount<'info, Mint>,
+
     
-    // Using a seed parameter allows creating multiple orders with same amount
+    // The OTC order PDA that stores all order details
+    // Multiple orders can be created with same amount using different seeds
     #[account(
         init,
         payer = buyer,
@@ -27,45 +54,96 @@ pub struct CreateOTCOrder<'info> {
     )]
     pub otc_order: Account<'info, OTCOrderMaker>,
 
-    #[account(
-        seeds = [b"listing", token_mint.key().as_ref(), maker.key().as_ref()],
-        bump = listing.bump,
-    )]
-    pub listing: Account<'info, Listing>,
-
+    // Program-controlled vault that holds buyer's SOL collateral
     #[account(
         seeds = [b"vault", token_mint.key().as_ref()],
-        bump = vault.bump,
+        bump,
     )]
     pub vault: Account<'info, SystemAccount>,
 
-    pub system_program: Program<'info, System>,
+    // Config account that stores protocol parameters
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+    )]
+    pub config: Account<'info, TurbineConfig>,
 
+    // Raydium CLMM accounts for TWAP price observation
+    #[account(
+        seeds = [OBSERVATION_SEED.as_bytes(), pool.key().as_ref()],
+        seeds::program = raydium_clmm_program.key(),
+        bump,
+    )]
+    pub observation_state: Account<'info, ObservationState>,
+
+    // The Raydium pool state for price reference
+    #[account(
+        constraint = (pool.token_mint_0 == token_mint.key() && pool.token_mint_1 == spl_token::native_mint::id()) || 
+                    (pool.token_mint_1 == token_mint.key() && pool.token_mint_0 == spl_token::native_mint::id()),
+    )]
+    pub pool: Account<'info, PoolState>,
+
+    // Required program accounts
+    pub raydium_clmm_program: Program<'info, RaydiumClmm>,
+    pub system_program: Program<'info, System>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
 impl<'info> CreateOTCOrder<'info> {
-    pub fn create_otc_order(&mut self, amount: u64, seed: u64, bumps: &CreateOTCOrderBumps, seller: Option<Pubkey>) -> Result<()> {
+    pub fn create_otc_order(&mut self, amount: u64, seed: u64, bumps: &CreateOTCOrderBumps, seller: Option<Pubkey>, expiry_timestamp: u64, premium: u16) -> Result<()> {
+
+        require_gte!(premium, self.config.min_premium, ErrorCode::InvalidPremium);
+        require_lte!(premium, self.config.max_premium, ErrorCode::InvalidPremium);
+
+        // Initialize the OTC order account with buyer details, amount, and constraints
         self.otc_order.set_inner(OTCOrderMaker {
             buyer: self.buyer.key(),
             token_mint: self.token_mint.key(),
             sol_amount: amount,
-            seller: seller, // so this could be done or it could be someone
+            seller,
             bump: bumps.otc_order,
             vault_bump: bumps.vault,
+            expiration_timestamp: expiry_timestamp,
+            premium,
         });
 
+        // Transfer SOL from buyer to program vault
         let cpi_program = self.system_program.to_account_info();
-
         let cpi_accounts = Transfer {
             from: self.buyer.to_account_info(),
             to: self.vault.to_account_info(),
             authority: self.buyer.to_account_info(),
         };
-
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
         transfer(cpi_ctx, amount)?;
+
+        Ok(())
+    }
+
+    pub fn cancel_otc_order(&mut self) -> Result<()> {
+        // Only the buyer who created the order can cancel it
+        require_keys_eq!(
+            self.buyer.key(),
+            self.otc_order.buyer,
+            ErrorCode::InvalidBuyer
+        );
+
+        // Transfer SOL back from vault to buyer
+        let vault_seeds = &[
+            b"vault",
+            self.token_mint.key().as_ref(),
+            &[self.otc_order.vault_bump],
+        ];
+        let vault_signer = &[&vault_seeds[..]];
+
+        let cpi_program = self.system_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.buyer.to_account_info(),
+            authority: self.vault.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, vault_signer);
+        transfer(cpi_ctx, self.otc_order.sol_amount)?;
 
         Ok(())
     }
