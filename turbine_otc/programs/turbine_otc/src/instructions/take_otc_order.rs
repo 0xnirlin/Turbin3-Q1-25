@@ -1,17 +1,28 @@
 use anchor_lang::prelude::*;
 use anchor_spl::{
-    token::{Mint, TokenInterface, Transfer, transfer},
+    token_interface::{Mint, TokenInterface, TokenAccount, transfer_checked},
     associated_token::AssociatedToken,
 };
 use raydium_clmm_cpi::{
     program::RaydiumClmm,
-    states::{OBSERVATION_SEED, ObservationState, PoolState},
+    states::{OBSERVATION_SEED, ObservationState, PoolState, AmmConfig, POOL_SEED},
 };
+use anchor_lang::system_program::{Transfer, transfer};
+use crate::state::tick_math::get_sqrt_price_at_tick;
 
-use raydium_clmm::libraries::tick_math::get_sqrt_price_at_tick;
 
-use crate::state::{OTCOrderMaker, TurbineConfig}; // Added TurbineConfig import
 
+
+use crate::state::{OTCOrderMaker, TurbineConfig};
+
+use solana_program::native_token::LAMPORTS_PER_SOL;
+
+// Option 1: Use the pubkey macro from anchor_lang instead
+pub const FUNDING_AMOUNT: u64 = LAMPORTS_PER_SOL;
+pub const WSOL_ID: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+pub const LOCK_CPMM_AUTHORITY: Pubkey = pubkey!("3f7GcQFG397GAaEnv51zR6tsTVihYRydnydDD1cXekxH");
+pub const DEFAULT_DECIMALS: u8 = 6;
+pub const DEFAULT_SUPPLY: u64 = 1_000_000_000_000_000;
 // when taking the order we want to transfer the tokens from the seller to the buyer's ATA
 // and transfer the SOL from the vault to the seller
 
@@ -27,6 +38,8 @@ pub enum ErrorCode {
     InvalidTokenAmount,
     #[msg("Math overflow occurred during calculation")]
     MathOverflow,
+    #[msg("Tick upper overflow")]
+    TickUpperOverflow,
 }
 
 #[derive(Accounts)]
@@ -36,16 +49,6 @@ pub struct TakeOTCOrder<'info> {
 
     // buyer will not be defined as signer
     pub buyer: SystemAccount<'info>,
-
-
-    // The token account of the token the buyer wishes to purchase
-    #[account(
-        init_if_needed,
-        payer = seller,
-        associated_token::mint = token_mint,
-        associated_token::authority = buyer
-    )]
-    pub make_token_ata: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         init_if_needed,
@@ -57,7 +60,10 @@ pub struct TakeOTCOrder<'info> {
 
     #[account(mut)] 
     pub seller_token_account: InterfaceAccount<'info, TokenAccount>,
-
+    
+    #[account(
+        constraint = token_mint.key() == otc_order.token_mint
+    )]
     pub token_mint: InterfaceAccount<'info, Mint>,
 
     // we are not closing this account since, we will allow partial fills if seller is set to NONE, otherwise it will be take it all or leave it, will create a separate instruction for closing the order
@@ -79,18 +85,42 @@ pub struct TakeOTCOrder<'info> {
         seeds = [b"config"],
         bump = config.bump,
     )]
-    pub config: Account<'info, TurbineConfig>, // Fixed Config to TurbineConfig
+    pub config: Account<'info, TurbineConfig>,
 
     // Raydium CLMM accounts for TWAP price observation
     #[account(
-        seeds = [OBSERVATION_SEED.as_bytes(), pool.key().as_ref()],
-        seeds::program = raydium_clmm_program.key(),
+        mut,
+        seeds = [OBSERVATION_SEED.as_bytes(), pool_state.key().as_ref()],
+        seeds::program = cp_swap_program.key(),
         bump,
     )]
-    pub observation_state: Account<'info, ObservationState>,
+    pub observation_state: AccountLoader<'info, ObservationState>,
+
+    pub cp_swap_program: Program<'info, RaydiumClmm>,
+
+    #[account(
+        mut,
+        address = WSOL_ID,
+        constraint = base_mint.key() < token_mint.key(),
+        mint::token_program = token_program,
+    )]
+    pub base_mint: Box<InterfaceAccount<'info, Mint>>,
 
     // The Raydium pool state for price reference
-    pub pool: Account<'info, PoolState>,
+    #[account(
+        mut,
+        seeds = [
+            POOL_SEED.as_bytes(),
+            amm_config.key().as_ref(),
+            base_mint.key().as_ref(),
+            token_mint.key().as_ref(),
+        ],
+        seeds::program = cp_swap_program.key(),
+        bump,
+    )]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    pub amm_config: Box<Account<'info, AmmConfig>>,
 
     pub raydium_clmm_program: Program<'info, RaydiumClmm>,
     pub system_program: Program<'info, System>,
@@ -99,6 +129,27 @@ pub struct TakeOTCOrder<'info> {
 }
 
 impl<'info> TakeOTCOrder<'info> {
+    fn transfer_sol(&self, amount_sol: u64, to: AccountInfo<'info>) -> Result<()> {
+        let token_mint_key = self.token_mint.key();
+        let vault_seeds = &[
+            b"vault".as_ref(),
+            token_mint_key.as_ref(),
+            &[self.otc_order.vault_bump],
+        ];
+        let vault_signer = &[&vault_seeds[..]];
+
+        let cpi_program = self.system_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to,
+        };
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, vault_signer);
+        transfer(cpi_ctx, amount_sol)?;
+
+        Ok(())
+    }
+
+
     // let's say 1 sol is worth 1 token
     // When taking the order, the seller provides tokens and receives SOL with a premium discount
     pub fn take_otc_order(&mut self, amount_sol: u64) -> Result<()> {
@@ -121,7 +172,7 @@ impl<'info> TakeOTCOrder<'info> {
 
         // Calculate TWAP using Raydium CLMM
         const OBSERVATION_NUM: usize = 100;
-        let latest_index = self.observation_state.observation_index as usize;
+        let latest_index = self.observation_state.load()?.observations.len() - 1;
         
         let mut sum_sqrt_price = 0u128;
         
@@ -129,7 +180,7 @@ impl<'info> TakeOTCOrder<'info> {
         for i in 0..10 {
             let index = (latest_index + OBSERVATION_NUM - i) % OBSERVATION_NUM;
             let sqrt_price = get_sqrt_price_at_tick(
-                self.observation_state.observations[index].tick_cumulative
+                self.observation_state.load()?.observations[index].sqrt_price_x64 as i32
             )?;
             sum_sqrt_price = sum_sqrt_price.checked_add(sqrt_price as u128)
                 .ok_or(ErrorCode::MathOverflow)?;
@@ -144,7 +195,7 @@ impl<'info> TakeOTCOrder<'info> {
             >> 64;
 
         // Calculate token amount based on pool token ordering
-        let token_amount = if self.pool.token_mint_0 == self.token_mint.key() {
+        let token_amount = if self.pool_state.load()?.token_mint_0 == self.token_mint.key() {
             // token0/SOL price
             (amount_sol as u128)
                 .checked_mul(twap_price_x64)
@@ -167,32 +218,18 @@ impl<'info> TakeOTCOrder<'info> {
         }
 
         // Transfer SOL from vault to seller
-        let vault_seeds = &[
-            b"vault",
-            self.token_mint.key().as_ref(),
-            &[self.otc_order.vault_bump],
-        ];
-        let vault_signer = &[&vault_seeds[..]];
-
-        let cpi_program = self.system_program.to_account_info();
-        let cpi_accounts = Transfer {
-            from: self.vault.to_account_info(),
-            to: self.seller.to_account_info(),
-            authority: self.vault.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, vault_signer);
-        transfer(cpi_ctx, amount_sol)?;
+        self.transfer_sol(amount_sol, self.seller.to_account_info())?;
 
         // Transfer tokens from seller to buyer
         let cpi_program = self.token_program.to_account_info();
-        let cpi_accounts = anchor_spl::token::TransferChecked {
+        let cpi_accounts = anchor_spl::token_interface::TransferChecked {
             from: self.seller_token_account.to_account_info(),
             mint: self.token_mint.to_account_info(),
             to: self.buyer_token_account.to_account_info(),
             authority: self.seller.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        anchor_spl::token::transfer_checked(cpi_ctx, token_amount_with_premium as u64, self.token_mint.decimals)?;
+        transfer_checked(cpi_ctx, token_amount_with_premium as u64, self.token_mint.decimals)?;
 
         // Update remaining order amount
         self.otc_order.sol_amount = self.otc_order.sol_amount

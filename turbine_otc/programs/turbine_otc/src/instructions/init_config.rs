@@ -23,11 +23,11 @@ pub struct InitConfig<'info> {
 }
 
 impl<'info> InitConfig<'info> {
-    pub fn init(&mut self, fee_percentage: u16, max_fee_percentage: u16, min_fee_percentage: u16, max_premium: u16, min_premium: u16, bumps: &InitConfigBumps, owner: Pubkey, listing_fee: u16) -> Result<()> {
+    pub fn init(&mut self, fee_percentage: u16, max_fee_percentage: u16, min_fee_percentage: u16, max_premium: u16, min_premium: u16, bumps: InitConfigBumps, owner: Pubkey, listing_fee: u16) -> Result<()> {
         // require the creator to be a specific hardcoded wallet address
         require_eq!(
             self.creator.key(),
-            Pubkey::from_str("HXtBm8XZbxaTt41uqaKhwUAa6Z1aPyvJdsZVENiWsetg").unwrap(),
+            pubkey!("HXtBm8XZbxaTt41uqaKhwUAa6Z1aPyvJGE1111111111"),
             TurbineError::InvalidOwner
         );
         // require the fee percentage to be between the max and min fee percentage

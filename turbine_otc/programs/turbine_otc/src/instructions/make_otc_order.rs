@@ -8,15 +8,11 @@
 */
 
 use anchor_lang::prelude::*;
-use anchor_spl::{
-    token::{Mint, TokenInterface, Transfer, transfer},
-    associated_token::AssociatedToken,
-};
-use raydium_clmm_cpi::{
-    program::RaydiumClmm,
-    states::{OBSERVATION_SEED, ObservationState, PoolState},
-};
+use anchor_spl::token_interface::{Mint, TokenInterface};
 use crate::state::{OTCOrderMaker, TurbineConfig};
+use solana_program::system_program;
+use anchor_lang::system_program::{Transfer, transfer};
+
 
 // ============================================================================
 // This instruction handles the creation of an OTC (Over-The-Counter) order
@@ -30,6 +26,8 @@ use crate::state::{OTCOrderMaker, TurbineConfig};
 pub enum ErrorCode {
     #[msg("Premium must be within allowed range")]
     InvalidPremium,
+    #[msg("Invalid buyer")]
+    InvalidBuyer,
 }
 
 #[derive(Accounts)]
@@ -56,10 +54,11 @@ pub struct CreateOTCOrder<'info> {
 
     // Program-controlled vault that holds buyer's SOL collateral
     #[account(
+        mut,
         seeds = [b"vault", token_mint.key().as_ref()],
         bump,
     )]
-    pub vault: Account<'info, SystemAccount>,
+    pub vault: SystemAccount<'info>,
 
     // Config account that stores protocol parameters
     #[account(
@@ -68,32 +67,16 @@ pub struct CreateOTCOrder<'info> {
     )]
     pub config: Account<'info, TurbineConfig>,
 
-    // Raydium CLMM accounts for TWAP price observation
-    #[account(
-        seeds = [OBSERVATION_SEED.as_bytes(), pool.key().as_ref()],
-        seeds::program = raydium_clmm_program.key(),
-        bump,
-    )]
-    pub observation_state: Account<'info, ObservationState>,
-
-    // The Raydium pool state for price reference
-    #[account(
-        constraint = (pool.token_mint_0 == token_mint.key() && pool.token_mint_1 == spl_token::native_mint::id()) || 
-                    (pool.token_mint_1 == token_mint.key() && pool.token_mint_0 == spl_token::native_mint::id()),
-    )]
-    pub pool: Account<'info, PoolState>,
-
     // Required program accounts
-    pub raydium_clmm_program: Program<'info, RaydiumClmm>,
     pub system_program: Program<'info, System>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
 impl<'info> CreateOTCOrder<'info> {
-    pub fn create_otc_order(&mut self, amount: u64, seed: u64, bumps: &CreateOTCOrderBumps, seller: Option<Pubkey>, expiry_timestamp: u64, premium: u16) -> Result<()> {
+    pub fn create_otc_order(&mut self, amount: u64, seed: u64, bumps: CreateOTCOrderBumps, seller: Option<Pubkey>, expiry_timestamp: u64, premium: u16) -> Result<()> {
 
-        require_gte!(premium, self.config.min_premium, ErrorCode::InvalidPremium);
-        require_lte!(premium, self.config.max_premium, ErrorCode::InvalidPremium);
+        require!(premium >= self.config.min_premium, ErrorCode::InvalidPremium);
+        require!(premium <= self.config.max_premium, ErrorCode::InvalidPremium);
 
         // Initialize the OTC order account with buyer details, amount, and constraints
         self.otc_order.set_inner(OTCOrderMaker {
@@ -107,12 +90,11 @@ impl<'info> CreateOTCOrder<'info> {
             premium,
         });
 
-        // Transfer SOL from buyer to program vault
+        // Transfer SOL from buyer to program vault using checked transfer
         let cpi_program = self.system_program.to_account_info();
         let cpi_accounts = Transfer {
             from: self.buyer.to_account_info(),
             to: self.vault.to_account_info(),
-            authority: self.buyer.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         transfer(cpi_ctx, amount)?;
@@ -128,10 +110,11 @@ impl<'info> CreateOTCOrder<'info> {
             ErrorCode::InvalidBuyer
         );
 
+        let token_mint = self.token_mint.key();
         // Transfer SOL back from vault to buyer
         let vault_seeds = &[
             b"vault",
-            self.token_mint.key().as_ref(),
+            token_mint.as_ref(),
             &[self.otc_order.vault_bump],
         ];
         let vault_signer = &[&vault_seeds[..]];
@@ -140,7 +123,6 @@ impl<'info> CreateOTCOrder<'info> {
         let cpi_accounts = Transfer {
             from: self.vault.to_account_info(),
             to: self.buyer.to_account_info(),
-            authority: self.vault.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, vault_signer);
         transfer(cpi_ctx, self.otc_order.sol_amount)?;
